@@ -1,7 +1,8 @@
-package site.kodev.kotlin_pubsub
+package site.kodev.pubsub
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
@@ -10,104 +11,86 @@ import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlin.coroutines.CoroutineContext
-import kotlin.reflect.KClass
 
-
-class PubSub(
-    coroutineContext: CoroutineContext?=null,
-    val defaultChannelCapacity: Int = 100
-)  {
-    private val map = HashMap<String, DataStream<*>>()
+@Suppress("UNCHECKED_CAST")
+class PubSub {
+    private val topics = mutableMapOf<String, Topic<*>>()
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val mapMutex = Mutex()
-    private val parentListener = coroutineContext?.let { CoroutineScope(it + SupervisorJob()) } ?: CoroutineScope(Dispatchers.Default + SupervisorJob())
-
-    /**
-     * Create a publisher with name and channelCapacity.
-     */
-    suspend fun <T: Any> publisher(name: String, channelCapacity: Int = defaultChannelCapacity): SendChannel<T>{
-        val publisherChannel =  Channel<T>(capacity = channelCapacity)
-        val dataStream = DataStream(
-            publisherChannel,
-            name,
-            Mutex(),
-            mutableSetOf(),
-        )
-        mapMutex.withLock {
-             map.putIfAbsent(name, dataStream) ?: throw Exception("Channel Already exists for name $name")
-        }
-        // Listener for channel
-        parentListener.launch {
-            for(i in publisherChannel){
-                parentListener.launch {
-                    dataStream.subscribers.forEach {
-                        it.send(i)
-                    }
-                }
-            }
-        }
-        return dataStream.publisherChannel
-    }
-
-    /**
-     * Create a publisher with enum
-     */
-    suspend fun <T: Any> publisher(enum: Enum<*>, channelCapacity: Int = defaultChannelCapacity): SendChannel<T> {
-        val name = enum.name
-        return publisher(name, channelCapacity)
-    }
-    suspend fun <T: Any> publisher(clazz: KClass<*>, channelCapacity: Int = defaultChannelCapacity): SendChannel<T> {
-        val name = clazz.simpleName!!
-        return publisher(name, channelCapacity)
-    }
-    suspend fun <T: Any> consumer(enum: Enum<*>, channelCapacity: Int = defaultChannelCapacity): ReceiveChannel<T>{
-        val name = enum.name
-        return consumer(name, channelCapacity)
-    }
-    suspend fun <T: Any> consumer(clazz: KClass<*>, channelCapacity: Int = defaultChannelCapacity): ReceiveChannel<T>{
-        val name = clazz.simpleName!!
-        return consumer(name, channelCapacity)
-    }
-    suspend fun <T: Any> consumer(name: String, channelCapacity: Int = defaultChannelCapacity): ReceiveChannel<T>{
-        val dataStream = mapMutex.withLock {
-            map[name] ?: throw Exception("No Channel for name $name")
-        }
-        @Suppress("UNCHECKED_CAST")
-        val castedDataStream = runCatching {
-            dataStream as DataStream<T>
-        }.getOrElse {
-            throw Exception("Couldn't cast DataStream",it)
-        }
-        val receiveChannel = Channel<T>(100)
-        castedDataStream.sharedSubscriberMutex.withLock {
-            castedDataStream.subscribers.add(receiveChannel)
-        }
-        return receiveChannel
-    }
-    suspend fun close(){
-        mapMutex.withLock {
-            map.forEach { (_, stream) ->
-                stream.publisherChannel.close()
-                parentListener.launch {
-                    stream.sharedSubscriberMutex.withLock {
-                        stream.subscribers.forEach {
-                            it.close()
+    suspend fun <T : Any> publisher(topicName: String, capacity: Int = Channel.BUFFERED): SendChannel<T>{
+        val topic: Topic<T> = mapMutex.withLock {
+            (topics[topicName] as? Topic<T>) ?: let {
+                val channel = Channel<T>(capacity)
+                val mutex = Mutex()
+                val subscribers = mutableSetOf<Channel<T>>()
+                val dispatcher = scope.launch {
+                    for(i in channel){
+                        for(j in subscribers){
+                            j.send(i)
                         }
                     }
                 }
-                map.clear()
+                val topic = Topic(
+                    channel,
+                    subscribers,
+                    mutex,
+                    dispatcher
+                )
+                topics[topicName] = topic
+                topic
+
             }
         }
-        parentListener.cancel()
+        return topic.publishChannel
     }
-    fun cancel(){
-        parentListener.cancel()
+    suspend fun <T : Any> subscribe(topicName: String, capacity: Int = Channel.BUFFERED): ReceiveChannel<T>{
+         val topic: Topic<T> = mapMutex.withLock {
+             (topics[topicName] as? Topic<T>) ?: let{
+                 val channel = Channel<T>(capacity)
+                 val mutex = Mutex()
+                 val subscribers = mutableSetOf<Channel<T>>()
+                 val dispatcher = scope.launch {
+                     for(i in channel){
+                         for(j in subscribers){
+                             j.send(i)
+                         }
+                     }
+                 }
+                 val topic = Topic(
+                     channel,
+                     subscribers,
+                     mutex,
+                     dispatcher
+                 )
+                 topics[topicName] = topic
+                 topic
+             }
+         }
+        val channel = topic.mutex.withLock {
+            val channel = Channel<T>(capacity)
+            topic.subscriber.add(channel)
+            channel
+        }
+        return channel
     }
+    suspend fun close(){
+        mapMutex.withLock {
+            topics.forEach { (string, topic) ->
+                topic.publishChannel.close()
+                topic.dispatcherJob.join()
+                topic.subscriber.forEach {
+                    it.close()
+                }
+            }
+            topics.clear()
+        }
+        scope.cancel()
+    }
+    private data class Topic<T: Any>(
+        val publishChannel: Channel<T>,
+        val subscriber: MutableSet<Channel<T>>,
+        val mutex: Mutex,
+        val dispatcherJob: Job
+    )
 }
 
-private data class DataStream<T : Any>(
-    val publisherChannel: SendChannel<T>,
-    val channelName: String,
-    val sharedSubscriberMutex: Mutex,
-    val subscribers: MutableSet<Channel<T>>
-)

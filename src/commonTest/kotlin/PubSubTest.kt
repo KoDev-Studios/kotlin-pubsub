@@ -1,3 +1,5 @@
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import site.kodev.pubsub.PubSub
@@ -5,6 +7,7 @@ import kotlin.concurrent.atomics.AtomicInt
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.time.Duration.Companion.seconds
 
 class PubSubTest {
     @Test
@@ -123,5 +126,54 @@ class PubSubTest {
         j3.join()
         j4.join()
         assertEquals(4000,count.load())
+    }
+    @Test
+    fun `locks all publishers`() = runTest {
+        val pubsub = PubSub().lockAll()
+        val publisher = pubsub.publisher<Int>("topic1")
+        val completable = CompletableDeferred<Int>()
+        launch {
+            publisher.send(1)
+            completable.complete(1)
+        }
+        delay(1.seconds)
+        val sub = pubsub.subscribe<Int>("topic1")
+        completable.complete(2)
+        pubsub.unlockAll()
+        val result = completable.await()
+        assertEquals(2, result)
+    }
+    @Test
+    fun `receives values after unlocking topic`() = runTest {
+        val pubsub = PubSub().lockAll()
+        val publisher = pubsub.publisher<Int>("topic1")
+        val completable = CompletableDeferred<Int>()
+        launch {
+            publisher.send(1)
+            completable.complete(1)
+        }
+        delay(1.seconds)
+        val sub = pubsub.subscribe<Int>("topic1")
+        completable.complete(2)
+        pubsub.unlockAll()
+        val result = completable.await()
+        val received = sub.receive()
+        assertEquals(2, result)
+        assertEquals(1, received)
+    }
+    @Test
+    fun `close topic`() = runTest {
+        val pubsub = PubSub()
+        val publisher = pubsub.publisher<Int>("topic1")
+        val rec = pubsub.subscribe<Int>("topic1",32)
+        repeat(32){
+            publisher.send(1)
+        }
+        publisher.close()
+        var count = 0
+        for(i in rec){
+            count++
+        }
+        assertEquals(32, count)
     }
 }
